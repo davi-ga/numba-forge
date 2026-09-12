@@ -19,6 +19,7 @@ Environment variables:
 """
 
 import argparse
+import ast
 import json
 import os
 import py_compile
@@ -96,11 +97,41 @@ def _annotate_documents(
     return annotated
 
 
+class _NpArrayStripper(ast.NodeTransformer):
+    """Rewrites `np.array(param, dtype=...)` to just `param` inside @njit functions.
+    
+    Numba cannot convert arrays to different dtypes via np.array().
+    Since the wrapper already converts lists to numpy arrays before passing
+    to the JIT function, np.array() on parameters is redundant.
+    """
+    
+    def _is_np_array_call(self, node: ast.Call) -> bool:
+        """Check if a call is np.array(...)."""
+        if isinstance(node.func, ast.Attribute):
+            if (isinstance(node.func.value, ast.Name) and 
+                node.func.value.id in ('np', 'numpy') and 
+                node.func.attr == 'array'):
+                return True
+        if isinstance(node.func, ast.Name) and node.func.id == 'array':
+            return True
+        return False
+    
+    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
+        """Replace `x = np.array(param, dtype=...)` with `x = param`."""
+        if (isinstance(node.value, ast.Call) and 
+            self._is_np_array_call(node.value) and 
+            len(node.value.args) >= 1):
+            # Replace with the first argument (the param being wrapped)
+            node.value = node.value.args[0]
+        return node
+
+
 def _postprocess_documents(documents: list[dict]) -> list[dict]:
     """Apply post-processing transformers after LLM generation.
     
     This converts patterns that the LLM might generate (like np.vectorize,
     hex(), bin(), np.unique with return_counts) to Numba-compatible code.
+    Also strips np.array() calls on parameters that are already arrays.
     """
     import ast
     from utils.unique_rewriter import NUMBA_UNIQUE_HELPER
@@ -122,6 +153,7 @@ def _postprocess_documents(documents: list[dict]) -> list[dict]:
             tree = VectorizeRewriter().visit(tree)
             tree = BuiltinRewriter().visit(tree)
             tree = UniqueRewriter().visit(tree)
+            tree = _NpArrayStripper().visit(tree)
             
             # Check if we need to add helper functions
             needs_unique_helper = any(
@@ -250,8 +282,13 @@ def run(
     preprocessed_docs = preprocessor.transform_documents(original_docs)
     payload = json.dumps(preprocessed_docs, ensure_ascii=False, indent=2)
 
-    # Generate equivalence tests once — re-used across every LLM retry
-    test_file_path = tester.generate(original_docs, output_dir)
+    # Step 1.6 — Write preprocessed code to temp dir for equivalence testing
+    input_dir = tempfile.mkdtemp(prefix="forge_input_")
+    patcher.to_files(input_dir, preprocessed_docs)
+    patcher.ensure_init_files(input_dir, [doc["path"] for doc in preprocessed_docs])
+
+    # Generate equivalence tests from preprocessed docs (matches output structure)
+    test_file_path = tester.generate(preprocessed_docs, output_dir)
 
     prev_created: list[str] = []
     for attempt in range(1, max_attempts + 1):
@@ -352,11 +389,14 @@ def run(
         created.append(helpers_path)
         prev_created = list(created)
 
+        # Ensure __init__.py files exist in output_dir for package imports
+        patcher.ensure_init_files(output_dir, [doc["path"] for doc in annotated_documents])
+
         # Step 6 — Run equivalence tests
         if test_file_path:
             if test_file_path not in created:
                 created.append(test_file_path)
-            tests_passed = tester.run(test_file_path, source_dir, output_dir)
+            tests_passed = tester.run(test_file_path, input_dir, output_dir)
             if not tests_passed:
                 if attempt < max_attempts:
                     print(

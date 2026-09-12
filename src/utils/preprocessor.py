@@ -11,10 +11,207 @@ These AST transformers run BEFORE the LLM to prepare code for Numba compilation:
 """
 
 import ast
+import copy
 from typing import Union
 from utils.vectorize_rewriter import VectorizeRewriter
 from utils.builtin_rewriter import BuiltinRewriter
 from utils.unique_rewriter import UniqueRewriter
+
+
+class ExternalImportStripper(ast.NodeTransformer):
+    """Removes imports from external libraries incompatible with Numba.
+    
+    Keeps only:
+    - numpy (as np)
+    - numba
+    - typing (for type hints)
+    - _numba_helpers (internal)
+    
+    Removes:
+    - sklearn
+    - multiprocessing
+    - Any other external libraries
+    """
+    
+    _ALLOWED_MODULES = frozenset({
+        'numpy', 'numba', 'typing', '_numba_helpers'
+    })
+    
+    def visit_Import(self, node: ast.Import) -> Union[ast.Import, None]:
+        # Check if any imported module is not allowed
+        for alias in node.names:
+            module_name = alias.name.split('.')[0]
+            if module_name not in self._ALLOWED_MODULES:
+                return None
+        return node
+    
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> Union[ast.ImportFrom, None]:
+        if node.module:
+            module_name = node.module.split('.')[0]
+            if module_name not in self._ALLOWED_MODULES:
+                return None
+        return node
+
+
+class ExternalFunctionStripper(ast.NodeTransformer):
+    """Removes ONLY functions that are pure wrappers of external libraries.
+    
+    Keeps functions that have substantial logic (loops, computations) even if
+    they use external calls. Only removes functions that are trivial wrappers.
+    """
+    
+    _EXTERNAL_CALLS = frozenset({
+        'NearestNeighbors', 'Pool', 'StratifiedKFold', 'cross_val_predict',
+        'KFold', 'GridSearchCV', 'RandomForestClassifier', 'SVC',
+    })
+    
+    def _is_trivial_wrapper(self, node: ast.FunctionDef) -> bool:
+        """Check if function is a trivial wrapper with no substantial logic."""
+        # Count non-trivial statements (loops, computations, etc.)
+        substantial_statements = 0
+        has_external_call = False
+        
+        for child in ast.walk(node):
+            if isinstance(child, (ast.For, ast.While, ast.If)):
+                substantial_statements += 1
+            elif isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Name):
+                    if child.func.id in self._EXTERNAL_CALLS:
+                        has_external_call = True
+        
+        # Remove only if it's a trivial wrapper with external calls
+        return has_external_call and substantial_statements < 3
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> Union[ast.FunctionDef, None]:
+        self.generic_visit(node)
+        if self._is_trivial_wrapper(node):
+            return None
+        return node
+
+
+class SelfStrippingTransformer(ast.NodeTransformer):
+    """Strips 'self' from method signatures and replaces self.attr with direct params.
+    
+    After ClassExtractor converts class methods to module-level functions, they
+    still have 'self' as first parameter. This transformer:
+    1. Removes statements that use external libraries (sklearn, etc.)
+    2. Removes 'self' from function signature
+    3. Replaces all self.attr references with attr
+    4. Adds any undefined names as parameters
+    """
+    
+    _EXTERNAL_ATTRS = frozenset({'NN', 'pool', 'model', 'clf', 'regressor'})
+    _BUILTINS = frozenset({
+        'range', 'len', 'print', 'int', 'float', 'str', 'list', 'dict',
+        'set', 'tuple', 'bool', 'type', 'isinstance', 'enumerate', 'zip',
+        'min', 'max', 'sum', 'abs', 'round', 'sorted', 'reversed', 'any',
+        'all', 'map', 'filter', 'hasattr', 'getattr', 'setattr', 'None',
+        'True', 'False',
+    })
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        self.generic_visit(node)
+        
+        if not node.args.args or node.args.args[0].arg != 'self':
+            return node
+        
+        # Step 1: Remove statements that use external libraries
+        new_body = []
+        for stmt in node.body:
+            uses_external = False
+            for child in ast.walk(stmt):
+                if (isinstance(child, ast.Attribute) and 
+                    isinstance(child.value, ast.Name) and 
+                    child.value.id == 'self' and 
+                    child.attr in self._EXTERNAL_ATTRS):
+                    uses_external = True
+                    break
+            if not uses_external:
+                new_body.append(stmt)
+        
+        node.body = new_body
+        
+        # Step 2: Remove 'self' from parameters
+        node.args.args = node.args.args[1:]
+        
+        # Step 3: Replace all self.attr with attr
+        class _SelfToParam(ast.NodeTransformer):
+            def visit_Attribute(self, attr_node):
+                if (isinstance(attr_node.value, ast.Name) and 
+                    attr_node.value.id == 'self'):
+                    return ast.copy_location(
+                        ast.Name(id=attr_node.attr, ctx=attr_node.ctx),
+                        attr_node
+                    )
+                return attr_node
+        
+        node.body = [_SelfToParam().visit(stmt) for stmt in node.body]
+        
+        # Step 4: Find all undefined names and add as parameters
+        existing_params = {arg.arg for arg in node.args.args}
+        defined_names = set()
+        used_names = set()
+        
+        for stmt in node.body:
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.Name):
+                    if isinstance(child.ctx, ast.Store):
+                        defined_names.add(child.id)
+                    elif isinstance(child.ctx, ast.Load):
+                        used_names.add(child.id)
+            # Also track augmented assignments targets (+=, etc.)
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.AugAssign):
+                    if isinstance(child.target, ast.Name):
+                        defined_names.add(child.target.id)
+        
+        # Track loop variables
+        for stmt in node.body:
+            for child in ast.walk(stmt):
+                if isinstance(child, (ast.For,)):
+                    if isinstance(child.target, ast.Name):
+                        defined_names.add(child.target.id)
+                    elif isinstance(child.target, ast.Tuple):
+                        for elt in child.target.elts:
+                            if isinstance(elt, ast.Name):
+                                defined_names.add(elt.id)
+        
+        undefined = used_names - defined_names - existing_params - self._BUILTINS
+        
+        # Also exclude names that look like module-level calls
+        # (e.g., NearestNeighborsFeats, np, os, etc.)
+        known_globals = set()
+        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if isinstance(child, ast.Import):
+                for alias in child.names:
+                    known_globals.add(alias.asname or alias.name)
+            elif isinstance(child, ast.ImportFrom):
+                for alias in child.names:
+                    known_globals.add(alias.asname or alias.name)
+        
+        undefined -= known_globals
+        
+        # Remove names that are likely function calls or class references
+        # (start with uppercase, or are used only in Call context)
+        call_only_names = set()
+        module_like_names = set()
+        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Name):
+                    call_only_names.add(child.func.id)
+            # Detect module-like usage: np.something, os.something
+            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
+                module_like_names.add(child.value.id)
+        
+        # Keep undefined names that are not call-only and not module-like
+        param_names = sorted(undefined - call_only_names - module_like_names)
+        
+        for name in param_names:
+            new_param = ast.arg(arg=name, annotation=None)
+            node.args.args.append(new_param)
+        
+        ast.fix_missing_locations(node)
+        return node
 
 
 class ClassExtractor(ast.NodeTransformer):

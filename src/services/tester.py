@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from typing import Optional
 
 from services.model import ModelService
@@ -12,8 +13,11 @@ class TesterService:
     def __init__(self, model: ModelService):
         self.model = model
 
-    def generate(self, original_docs: list, output_dir: str) -> Optional[str]:
-        """Generate a test file from *original_docs* and write it to *output_dir*.
+    def generate(self, docs: list, output_dir: str) -> Optional[str]:
+        """Generate a test file from *docs* and write it to *output_dir*.
+
+        *docs* should be the preprocessed documents (functions extracted, no external libs)
+        so the LLM generates tests that match the output structure.
 
         Returns the absolute path of the written test file, or None if generation
         failed.
@@ -21,7 +25,7 @@ class TesterService:
         print("[forge] Generating equivalence tests...")
         try:
             test_data = self.model.generate_test(
-                json.dumps(original_docs, ensure_ascii=False, indent=2)
+                json.dumps(docs, ensure_ascii=False, indent=2)
             )
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"[forge] WARNING: Test generation failed: {exc}", file=sys.stderr)
@@ -56,13 +60,16 @@ class TesterService:
             )
             return None
 
-    def run(self, test_file_path: str, source_dir: str, output_dir: str) -> bool:
-        """Run *test_file_path* against both *source_dir* and *output_dir*.
+    def run(self, test_file_path: str, input_dir: str, output_dir: str) -> bool:
+        """Run *test_file_path* against both *input_dir* and *output_dir*.
+
+        *input_dir* should contain the preprocessed code (without @njit).
+        *output_dir* should contain the annotated code (with @njit).
 
         Returns True only if both runs pass.
         """
         runs = [
-            ("input (original)", os.path.abspath(source_dir)),
+            ("input (preprocessed)", os.path.abspath(input_dir)),
             ("output (numba-annotated)", os.path.abspath(output_dir)),
         ]
         all_passed = True

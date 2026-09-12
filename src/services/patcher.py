@@ -74,3 +74,20 @@ class PatcherService:
         with open(dest, "w", encoding="utf-8") as fh:
             fh.write(DEEP_TO_LIST_SRC.lstrip("\n"))
         return dest
+
+    def ensure_init_files(self, root: str, relative_paths: List[str]) -> None:
+        """Create empty __init__.py files in all subdirectories containing Python files.
+        
+        This ensures that subdirectories are recognized as Python packages.
+        """
+        dirs_with_py = set()
+        for rel_path in relative_paths:
+            dir_part = os.path.dirname(rel_path)
+            if dir_part:
+                dirs_with_py.add(dir_part)
+        
+        for dir_rel in dirs_with_py:
+            init_path = os.path.join(root, dir_rel, "__init__.py")
+            if not os.path.exists(init_path):
+                with open(init_path, "w", encoding="utf-8") as f:
+                    f.write("")

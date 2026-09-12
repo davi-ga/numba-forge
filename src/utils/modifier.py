@@ -118,6 +118,15 @@ class _ZipToRangeLoop(ast.NodeTransformer):
         return ast.fix_missing_locations(new_for)
 
 
+class _NormalizeNumbaAlias(ast.NodeTransformer):
+    """Replaces all references to 'nb' (from 'import numba as nb') with 'numba'."""
+
+    def visit_Name(self, node: ast.Name) -> ast.Name:
+        if node.id == "nb":
+            node.id = "numba"
+        return node
+
+
 class Inserter(ast.NodeTransformer):
 
     def __init__(self) -> None:
@@ -402,21 +411,65 @@ class Inserter(ast.NodeTransformer):
     ) -> ast.FunctionDef:
         """Generate a plain Python wrapper that sanitizes inputs and converts typed.List → list."""
 
-        call_args = [
-            ast.Call(
-                func=ast.Name(id="_sanitize_for_numba", ctx=ast.Load()),
-                args=[ast.Name(id=a.arg, ctx=ast.Load())],
-                keywords=[],
+        call_args = []
+        for a in args.posonlyargs + args.args:
+            # For list arguments, convert to numpy array first (to avoid np.array(typed_list) error in JIT)
+            call_args.append(
+                ast.Call(
+                    func=ast.Name(id="_sanitize_for_numba", ctx=ast.Load()),
+                    args=[
+                        ast.IfExp(
+                            test=ast.Call(
+                                func=ast.Name(id="isinstance", ctx=ast.Load()),
+                                args=[
+                                    ast.Name(id=a.arg, ctx=ast.Load()),
+                                    ast.Name(id="list", ctx=ast.Load()),
+                                ],
+                                keywords=[],
+                            ),
+                            body=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id="np", ctx=ast.Load()),
+                                    attr="array",
+                                    ctx=ast.Load(),
+                                ),
+                                args=[ast.Name(id=a.arg, ctx=ast.Load())],
+                                keywords=[],
+                            ),
+                            orelse=ast.Name(id=a.arg, ctx=ast.Load()),
+                        )
+                    ],
+                    keywords=[],
+                )
             )
-            for a in args.posonlyargs + args.args
-        ]
 
         call_kwargs = [
             ast.keyword(
                 arg=a.arg,
                 value=ast.Call(
                     func=ast.Name(id="_sanitize_for_numba", ctx=ast.Load()),
-                    args=[ast.Name(id=a.arg, ctx=ast.Load())],
+                    args=[
+                        ast.IfExp(
+                            test=ast.Call(
+                                func=ast.Name(id="isinstance", ctx=ast.Load()),
+                                args=[
+                                    ast.Name(id=a.arg, ctx=ast.Load()),
+                                    ast.Name(id="list", ctx=ast.Load()),
+                                ],
+                                keywords=[],
+                            ),
+                            body=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id="np", ctx=ast.Load()),
+                                    attr="array",
+                                    ctx=ast.Load(),
+                                ),
+                                args=[ast.Name(id=a.arg, ctx=ast.Load())],
+                                keywords=[],
+                            ),
+                            orelse=ast.Name(id=a.arg, ctx=ast.Load()),
+                        )
+                    ],
                     keywords=[],
                 ),
             )
@@ -449,6 +502,10 @@ class Inserter(ast.NodeTransformer):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Union[ast.FunctionDef, list]:
 
         if node.name in ("_sanitize_for_numba", "_deep_to_list"):
+            return node
+
+        # Skip Flask endpoints and functions marked with _skip_numba
+        if getattr(node, '_skip_numba', False):
             return node
 
         self._strip_duplicate_numba_decorators(node)
@@ -487,13 +544,35 @@ class Inserter(ast.NodeTransformer):
     def importer(self, tree: ast.AST) -> None:
         self._internal_callees = self._collect_internal_callees(tree)
 
-        if not any(
-            isinstance(node, ast.Import) and node.names[0].name == "numba"
-            for node in tree.body
-        ):
+        # Normalize "import numba as nb" to "import numba"
+        has_numba_alias = False
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "numba":
+                        has_numba_alias = True
+                        if alias.asname is not None:
+                            alias.asname = None
+
+        if has_numba_alias:
+            _NormalizeNumbaAlias().visit(tree)
+
+        if not has_numba_alias:
             import_node = ast.Import(names=[ast.alias(name="numba")])
             tree.body.insert(0, import_node)
             ast.fix_missing_locations(import_node)
+
+        # Ensure "import numpy as np" is present
+        has_numpy = any(
+            isinstance(node, ast.Import) and any(
+                n.name == "numpy" for n in node.names
+            )
+            for node in tree.body
+        )
+        if not has_numpy:
+            numpy_import = ast.Import(names=[ast.alias(name="numpy", asname="np")])
+            tree.body.insert(0, numpy_import)
+            ast.fix_missing_locations(numpy_import)
 
         if not any(
             isinstance(node, ast.ImportFrom) and node.module == "_numba_helpers"

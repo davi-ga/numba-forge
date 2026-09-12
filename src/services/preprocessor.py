@@ -9,6 +9,9 @@ from utils.preprocessor import (
     ClassExtractor,
     IOStripper,
     BooleanMaskRewriter,
+    ExternalImportStripper,
+    ExternalFunctionStripper,
+    SelfStrippingTransformer,
 )
 
 
@@ -17,10 +20,19 @@ class PreprocessorService:
 
     def __init__(self, enable_class_extract: bool = True,
                  enable_io_strip: bool = True,
-                 enable_bool_mask_rewrite: bool = True):
+                 enable_bool_mask_rewrite: bool = True,
+                 enable_import_strip: bool = True,
+                 enable_function_strip: bool = True,
+                 enable_self_strip: bool = True):
         self.transformers = []
         if enable_class_extract:
             self.transformers.append(("ClassExtractor", ClassExtractor()))
+        if enable_import_strip:
+            self.transformers.append(("ExternalImportStripper", ExternalImportStripper()))
+        if enable_function_strip:
+            self.transformers.append(("ExternalFunctionStripper", ExternalFunctionStripper()))
+        if enable_self_strip:
+            self.transformers.append(("SelfStrippingTransformer", SelfStrippingTransformer()))
         if enable_io_strip:
             self.transformers.append(("IOStripper", IOStripper()))
         if enable_bool_mask_rewrite:
