@@ -87,6 +87,8 @@ class Middleware:
         """
         self._optimized: dict[str, Callable] = {}
         self._fallbacks: dict[str, Callable] = fallbacks or {}
+        self.warmup_done: bool = False
+        self.warmup_thread: threading.Thread | None = None
 
         for mod in modules:
             self._register(mod)
@@ -95,10 +97,28 @@ class Middleware:
     # Internal
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _is_registrable(obj) -> bool:
+        """Functions, builtins, and Numba dispatchers.
+
+        Numba ``@njit`` functions that are called internally keep their name
+        as a ``CPUDispatcher`` object (no Python wrapper is generated for
+        internal callees).  ``inspect.isfunction`` returns False for those, so
+        we must register callables whose type comes from numba as well.
+        """
+        if inspect.isfunction(obj) or inspect.isbuiltin(obj):
+            return True
+        if inspect.isclass(obj) or inspect.ismodule(obj) or inspect.ismethod(obj):
+            return False
+        return callable(obj) and (type(obj).__module__ or "").startswith("numba")
+
     def _register(self, module) -> None:
-        for name, obj in inspect.getmembers(module, inspect.isfunction):
-            if not name.startswith("_"):
-                self._optimized[name] = obj
+        for name, obj in inspect.getmembers(module, self._is_registrable):
+            if name.startswith("_"):
+                continue
+            if getattr(obj, "__module__", "") == "typing":
+                continue
+            self._optimized[name] = obj
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -134,7 +154,22 @@ class Middleware:
             except Exception as exc:
                 results[name] = {"status": "failed", "error": str(exc)}
 
+        self.warmup_done = True
         return results
+
+    def warmup_async(self, inputs: dict[str, tuple] | None = None) -> threading.Thread:
+        """Run :meth:`warmup` in a daemon thread so the container can accept
+        requests (health checks) while JIT compilation proceeds.
+
+        Prevents gunicorn WORKER TIMEOUT / Cloud Run startup failures when
+        compilation is longer than the boot deadline.
+        """
+        self.warmup_done = False
+        self.warmup_thread = threading.Thread(
+            target=self.warmup, kwargs={"inputs": inputs}, daemon=True
+        )
+        self.warmup_thread.start()
+        return self.warmup_thread
 
     def call(self, func_name: str, *args, **kwargs) -> dict:
         """

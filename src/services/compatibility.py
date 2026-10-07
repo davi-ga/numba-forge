@@ -10,6 +10,50 @@ import sys
 from typing import List, Tuple
 
 
+# Issues whose root cause cannot be removed by refactoring: the function
+# legitimately depends on an external library, or its structure is inherent
+# (orchestration dicts, string formatting, class definitions).  Retrying the
+# LLM for these is guaranteed to waste an API call, because the function will
+# simply be left as a plain-Python wrapper (which is correct behaviour).
+_NON_ACTIONABLE_MARKERS = (
+    # Unavoidable external-library dependencies → plain-Python wrapper.
+    "external library",
+    "from scipy",
+    # Inherent non-numeric structure → plain-Python function.
+    "Dict literal",
+    "Set literal",
+    "dict() is not",
+    "set() is not",
+    "frozenset() is not",
+    "Class '",
+    # Already handled automatically by the post-processing rewriters.
+    "np.vectorize()",
+    "np.unique(return_counts",
+    "np.unique(return_index",
+    "np.unique(return_inverse",
+    "hex() is not",
+    "bin() is not",
+    "oct() is not",
+    "try/except block",
+    # Lambdas survive np.vectorize rewriting; such functions stay Python.
+    "Lambda expression",
+)
+
+
+def has_actionable_errors(issues: List[Tuple[str, int, str]]) -> bool:
+    """Return True if any error-severity issue could plausibly be fixed.
+
+    Only actionable issues justify another (costly) LLM round-trip.
+    """
+    for severity, _line, message in issues:
+        if severity != "error":
+            continue
+        if any(marker in message for marker in _NON_ACTIONABLE_MARKERS):
+            continue
+        return True
+    return False
+
+
 class NumbaCompatibilityChecker:
     """Validates code for Numba nopython compatibility.
     

@@ -26,6 +26,7 @@ class ExternalImportStripper(ast.NodeTransformer):
     - numba
     - typing (for type hints)
     - _numba_helpers (internal)
+    - os (standard library)
     
     Removes:
     - sklearn
@@ -34,14 +35,21 @@ class ExternalImportStripper(ast.NodeTransformer):
     """
     
     _ALLOWED_MODULES = frozenset({
-        'numpy', 'numba', 'typing', '_numba_helpers'
+        'numpy', 'numba', 'typing', '_numba_helpers', 'os'
     })
+    
+    def __init__(self):
+        super().__init__()
+        self.removed_names = set()
     
     def visit_Import(self, node: ast.Import) -> Union[ast.Import, None]:
         # Check if any imported module is not allowed
         for alias in node.names:
             module_name = alias.name.split('.')[0]
             if module_name not in self._ALLOWED_MODULES:
+                # Track removed names for OrphanCallStripper
+                name = alias.asname or alias.name.split('.')[0]
+                self.removed_names.add(name)
                 return None
         return node
     
@@ -49,7 +57,61 @@ class ExternalImportStripper(ast.NodeTransformer):
         if node.module:
             module_name = node.module.split('.')[0]
             if module_name not in self._ALLOWED_MODULES:
+                # Track removed names for OrphanCallStripper
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    self.removed_names.add(name)
                 return None
+        return node
+
+
+class OrphanCallStripper(ast.NodeTransformer):
+    """Removes module-level statements that depend on removed imports.
+    
+    After ExternalImportStripper removes imports, calls or assignments
+    at module level (outside functions) that reference those names will
+    cause NameError. This transformer removes such orphan statements.
+    """
+    
+    def __init__(self, removed_names: set):
+        super().__init__()
+        self.removed_names = removed_names
+        self._stripped_names: set = set()
+    
+    def _call_uses_removed_name(self, node: ast.Call) -> bool:
+        if isinstance(node.func, ast.Name):
+            if node.func.id in self.removed_names:
+                return True
+        elif isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                if node.func.value.id in self.removed_names:
+                    return True
+        return False
+    
+    def visit_Expr(self, node: ast.Expr) -> Union[ast.Expr, None]:
+        if isinstance(node.value, ast.Call):
+            if self._call_uses_removed_name(node.value):
+                return None
+        return node
+    
+    def visit_Assign(self, node: ast.Assign) -> Union[ast.Assign, None]:
+        if isinstance(node.value, ast.Call):
+            if self._call_uses_removed_name(node.value):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        self._stripped_names.add(t.id)
+                return None
+        return node
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> Union[ast.FunctionDef, None]:
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Call):
+                if isinstance(dec.func, ast.Attribute) and isinstance(dec.func.value, ast.Name):
+                    if dec.func.value.id in self.removed_names or dec.func.value.id in self._stripped_names:
+                        return None
+            elif isinstance(dec, ast.Attribute) and isinstance(dec.value, ast.Name):
+                if dec.value.id in self.removed_names or dec.value.id in self._stripped_names:
+                    return None
         return node
 
 
@@ -241,6 +303,11 @@ class ClassExtractor(ast.NodeTransformer):
                 new_name = f"{class_name}_{item.name}"
                 item.name = new_name
                 
+                item.decorator_list = [
+                    dec for dec in item.decorator_list
+                    if not (isinstance(dec, ast.Name) and dec.id in ("staticmethod", "classmethod", "property"))
+                ]
+                
                 if isinstance(item, ast.FunctionDef):
                     extracted_functions.append(item)
         
@@ -260,7 +327,8 @@ class IOStripper(ast.NodeTransformer):
 
     _IO_FUNCTIONS = frozenset({
         "print", "input", "open", "exec", "eval",
-        "logging", "logger", "log",
+        "logging", "logger", "log", "warn", "warnings",
+        "abort", "flash", "redirect", "make_response",
     })
 
     def visit_Expr(self, node: ast.Expr) -> Union[ast.Expr, None]:
@@ -282,6 +350,49 @@ class IOStripper(ast.NodeTransformer):
         return None
 
 
+class EmptyBlockStripper(ast.NodeTransformer):
+    """Removes empty if/else/for/while blocks that cause IndentationError.
+    
+    After IOStripper or ExternalImportStripper remove statements, some
+    blocks may become empty (e.g., `if sls_stage == 'local':` with no body).
+    This transformer removes such empty blocks to prevent syntax errors.
+    """
+
+    def visit_If(self, node: ast.If) -> Union[ast.If, None]:
+        self.generic_visit(node)
+        
+        # Remove if both body and orelse are empty
+        if not node.body and not node.orelse:
+            return None
+        
+        # If body is empty but orelse exists, convert to if not condition
+        if not node.body and node.orelse:
+            node.test = ast.UnaryOp(op=ast.Not(), operand=node.test)
+            node.body = node.orelse
+            node.orelse = []
+            return node
+        
+        return node
+
+    def visit_For(self, node: ast.For) -> Union[ast.For, None]:
+        self.generic_visit(node)
+        
+        # Remove if both body and orelse are empty
+        if not node.body and not node.orelse:
+            return None
+        
+        return node
+
+    def visit_While(self, node: ast.While) -> Union[ast.While, None]:
+        self.generic_visit(node)
+        
+        # Remove if both body and orelse are empty
+        if not node.body and not node.orelse:
+            return None
+        
+        return node
+
+
 class BooleanMaskRewriter(ast.NodeTransformer):
     """Converts boolean masking operations to explicit loops.
     
@@ -290,27 +401,71 @@ class BooleanMaskRewriter(ast.NodeTransformer):
         result[result == 0.0] = 1.0
     
     Into:
-        for _i in range(result.shape[0]):
-            for _j in range(result.shape[1]):
-                if bool_mask[_i, _j]:
-                    result[_i, _j] = value
+        for _idx in np.ndindex(result.shape):
+            if bool_mask[_idx]:
+                result[_idx] = value
     """
 
+    def __init__(self):
+        super().__init__()
+        self._bool_mask_names: set = set()
+        self._integer_names: set = set()
+
+    def _build_name_defs(self, node: ast.AST) -> None:
+        """Pre-scan the AST to classify variable names as boolean masks or integer indices."""
+        self._bool_mask_names = set()
+        self._integer_names = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Name):
+                        if isinstance(child.value, ast.Compare):
+                            self._bool_mask_names.add(target.id)
+                        elif isinstance(child.value, (ast.Constant, ast.Call, ast.BinOp)):
+                            self._integer_names.add(target.id)
+            elif isinstance(child, ast.For):
+                if isinstance(child.target, ast.Name):
+                    self._integer_names.add(child.target.id)
+                elif isinstance(child.target, ast.Tuple):
+                    for elt in child.target.elts:
+                        if isinstance(elt, ast.Name):
+                            self._integer_names.add(elt.id)
+                if isinstance(child.iter, ast.Call):
+                    if isinstance(child.iter.func, ast.Name) and child.iter.func.id == 'range':
+                        if isinstance(child.target, ast.Name):
+                            self._integer_names.add(child.target.id)
+
     def _is_bool_mask_slice(self, slice_node: ast.AST) -> bool:
-        """Check if a subscript slice is a boolean mask (Name or Compare)."""
+        """Check if a subscript slice is a known boolean mask."""
         if isinstance(slice_node, ast.Name):
-            return True
+            return slice_node.id in self._bool_mask_names
         if isinstance(slice_node, ast.Compare):
             return True
+        if isinstance(slice_node, ast.UnaryOp) and isinstance(slice_node.op, ast.Invert):
+            if isinstance(slice_node.operand, ast.Name):
+                return slice_node.operand.id in self._bool_mask_names
         return False
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        self._build_name_defs(node)
+        self.generic_visit(node)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        old_bool = self._bool_mask_names.copy()
+        old_int = self._integer_names.copy()
+        self._build_name_defs(node)
+        self.generic_visit(node)
+        self._bool_mask_names = old_bool
+        self._integer_names = old_int
+        return node
 
     def _make_indexed_condition(self, condition: ast.AST, array_name: str) -> ast.AST:
         """Replace array references in a Compare condition with indexed versions."""
-        i_idx = ast.Name(id="_i", ctx=ast.Load())
-        j_idx = ast.Name(id="_j", ctx=ast.Load())
+        idx_tuple = ast.Name(id="_idx", ctx=ast.Load())
         indexed = ast.Subscript(
             value=ast.Name(id=array_name, ctx=ast.Load()),
-            slice=ast.Tuple(elts=[i_idx, j_idx], ctx=ast.Load()),
+            slice=idx_tuple,
             ctx=ast.Load(),
         )
 
@@ -341,14 +496,40 @@ class BooleanMaskRewriter(ast.NodeTransformer):
         
         array_name = target_array.id
         
-        i_idx = ast.Name(id="_i", ctx=ast.Load())
-        j_idx = ast.Name(id="_j", ctx=ast.Load())
+        idx_tuple = ast.Name(id="_idx", ctx=ast.Load())
+        
+        bool_mask_names = self._bool_mask_names
+
+        class _BoolMaskReplacer(ast.NodeTransformer):
+            def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+                if not (isinstance(node.value, ast.Name) and node.value.id == array_name):
+                    return node
+                s = node.slice
+                if isinstance(s, ast.Name) and s.id in bool_mask_names:
+                    return ast.copy_location(
+                        ast.Subscript(value=ast.Name(id=array_name, ctx=ast.Load()), slice=idx_tuple, ctx=ast.Load()),
+                        node,
+                    )
+                if isinstance(s, ast.Compare):
+                    return ast.copy_location(
+                        ast.Subscript(value=ast.Name(id=array_name, ctx=ast.Load()), slice=idx_tuple, ctx=ast.Load()),
+                        node,
+                    )
+                if isinstance(s, ast.UnaryOp) and isinstance(s.op, ast.Invert):
+                    if isinstance(s.operand, ast.Name) and s.operand.id in bool_mask_names:
+                        return ast.copy_location(
+                            ast.Subscript(value=ast.Name(id=array_name, ctx=ast.Load()), slice=idx_tuple, ctx=ast.Load()),
+                            node,
+                        )
+                return node
+        
+        value = _BoolMaskReplacer().visit(value)
         
         inner_assign = ast.Assign(
             targets=[
                 ast.Subscript(
                     value=ast.Name(id=array_name, ctx=ast.Store()),
-                    slice=ast.Tuple(elts=[i_idx, j_idx], ctx=ast.Load()),
+                    slice=idx_tuple,
                     ctx=ast.Store(),
                 )
             ],
@@ -361,11 +542,24 @@ class BooleanMaskRewriter(ast.NodeTransformer):
             mask_name = slice_node.id
             if_test = ast.Subscript(
                 value=ast.Name(id=mask_name, ctx=ast.Load()),
-                slice=ast.Tuple(elts=[i_idx, j_idx], ctx=ast.Load()),
+                slice=idx_tuple,
                 ctx=ast.Load(),
             )
         elif isinstance(slice_node, ast.Compare):
             if_test = self._make_indexed_condition(slice_node, array_name)
+        elif isinstance(slice_node, ast.UnaryOp) and isinstance(slice_node.op, ast.Invert):
+            if isinstance(slice_node.operand, ast.Name):
+                mask_name = slice_node.operand.id
+                if_test = ast.UnaryOp(
+                    op=ast.Not(),
+                    operand=ast.Subscript(
+                        value=ast.Name(id=mask_name, ctx=ast.Load()),
+                        slice=idx_tuple,
+                        ctx=ast.Load(),
+                    ),
+                )
+            else:
+                return node
         else:
             return node
         
@@ -375,49 +569,211 @@ class BooleanMaskRewriter(ast.NodeTransformer):
             orelse=[],
         )
         
-        j_loop = ast.For(
-            target=ast.Name(id="_j", ctx=ast.Store()),
-            iter=ast.Call(
-                func=ast.Name(id="range", ctx=ast.Load()),
-                args=[
-                    ast.Subscript(
-                        value=ast.Attribute(
-                            value=ast.Name(id=array_name, ctx=ast.Load()),
-                            attr="shape",
-                            ctx=ast.Load(),
-                        ),
-                        slice=ast.Constant(value=1),
-                        ctx=ast.Load(),
-                    )
-                ],
-                keywords=[],
+        # Use np.ndindex for dimension-agnostic iteration
+        ndindex_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="np", ctx=ast.Load()),
+                attr="ndindex",
+                ctx=ast.Load(),
             ),
+            args=[
+                ast.Attribute(
+                    value=ast.Name(id=array_name, ctx=ast.Load()),
+                    attr="shape",
+                    ctx=ast.Load(),
+                )
+            ],
+            keywords=[],
+        )
+        
+        loop = ast.For(
+            target=ast.Name(id="_idx", ctx=ast.Store()),
+            iter=ndindex_call,
             body=[if_stmt],
             orelse=[],
         )
         
-        i_loop = ast.For(
-            target=ast.Name(id="_i", ctx=ast.Store()),
-            iter=ast.Call(
-                func=ast.Name(id="range", ctx=ast.Load()),
-                args=[
-                    ast.Subscript(
-                        value=ast.Attribute(
-                            value=ast.Name(id=array_name, ctx=ast.Load()),
-                            attr="shape",
-                            ctx=ast.Load(),
-                        ),
-                        slice=ast.Constant(value=0),
-                        ctx=ast.Load(),
+        return ast.fix_missing_locations(loop)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> Union[ast.AugAssign, ast.For]:
+        """Rewrite augmented assignments with boolean masks to explicit loops.
+
+        Numba does not support multi-dimensional boolean indices on the LHS,
+        e.g. ``arr[~mask] /= 12.92``.
+        """
+        target = node.target
+        if not isinstance(target, ast.Subscript):
+            return node
+        if not isinstance(target.value, ast.Name):
+            return node
+
+        array_name = target.value.id
+        slice_node = target.slice
+
+        if not self._is_bool_mask_slice(slice_node):
+            return node
+
+        idx_tuple = ast.Name(id="_idx", ctx=ast.Load())
+
+        # Indexed RHS references (e.g. arr[mask] in ``arr[mask] += arr[mask]``)
+        bool_mask_names = self._bool_mask_names
+
+        class _BoolMaskReplacer(ast.NodeTransformer):
+            def visit_Subscript(self, n: ast.Subscript) -> ast.AST:
+                if not (isinstance(n.value, ast.Name) and n.value.id == array_name):
+                    return n
+                s = n.slice
+                if isinstance(s, ast.Name) and s.id in bool_mask_names:
+                    return ast.copy_location(
+                        ast.Subscript(value=ast.Name(id=array_name, ctx=ast.Load()), slice=idx_tuple, ctx=ast.Load()),
+                        n,
                     )
-                ],
-                keywords=[],
+                if isinstance(s, ast.Compare):
+                    return ast.copy_location(
+                        ast.Subscript(value=ast.Name(id=array_name, ctx=ast.Load()), slice=idx_tuple, ctx=ast.Load()),
+                        n,
+                    )
+                if isinstance(s, ast.UnaryOp) and isinstance(s.op, ast.Invert):
+                    if isinstance(s.operand, ast.Name) and s.operand.id in bool_mask_names:
+                        return ast.copy_location(
+                            ast.Subscript(value=ast.Name(id=array_name, ctx=ast.Load()), slice=idx_tuple, ctx=ast.Load()),
+                            n,
+                        )
+                return n
+
+        value = _BoolMaskReplacer().visit(node.value)
+
+        inner = ast.AugAssign(
+            target=ast.Subscript(
+                value=ast.Name(id=array_name, ctx=ast.Load()),
+                slice=idx_tuple,
+                ctx=ast.Store(),
             ),
-            body=[j_loop],
+            op=node.op,
+            value=value,
+            lineno=node.lineno,
+            col_offset=node.col_offset,
+        )
+
+        if isinstance(slice_node, ast.Name):
+            if_test = ast.Subscript(
+                value=ast.Name(id=slice_node.id, ctx=ast.Load()),
+                slice=idx_tuple,
+                ctx=ast.Load(),
+            )
+        elif isinstance(slice_node, ast.UnaryOp) and isinstance(slice_node.op, ast.Invert):
+            if not isinstance(slice_node.operand, ast.Name):
+                return node
+            if_test = ast.UnaryOp(
+                op=ast.Not(),
+                operand=ast.Subscript(
+                    value=ast.Name(id=slice_node.operand.id, ctx=ast.Load()),
+                    slice=idx_tuple,
+                    ctx=ast.Load(),
+                ),
+            )
+        else:
+            return node
+
+        if_stmt = ast.If(test=if_test, body=[inner], orelse=[])
+
+        ndindex_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="np", ctx=ast.Load()),
+                attr="ndindex",
+                ctx=ast.Load(),
+            ),
+            args=[
+                ast.Attribute(
+                    value=ast.Name(id=array_name, ctx=ast.Load()),
+                    attr="shape",
+                    ctx=ast.Load(),
+                )
+            ],
+            keywords=[],
+        )
+
+        loop = ast.For(
+            target=ast.Name(id="_idx", ctx=ast.Store()),
+            iter=ndindex_call,
+            body=[if_stmt],
             orelse=[],
         )
-        
-        return ast.fix_missing_locations(i_loop)
+
+        return ast.fix_missing_locations(loop)
+
+
+class StrCommentStripper(ast.NodeTransformer):
+    """Removes bare string-expression statements used as section comments.
+
+    Original code often contains mid-body docstring-like comments::
+
+        def f(x):
+            "real docstring"
+            "        Section comment.        "
+            return x
+
+    After ClassExtractor these stray strings survive inside function bodies.
+    They are pure noise, but they make string/annotation-based Numba
+    heuristics misclassify numeric kernels as non-JIT-able. Only the first
+    statement (the actual docstring) is kept.
+    """
+
+    @staticmethod
+    def _is_str_expr(stmt: ast.stmt) -> bool:
+        return (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        )
+
+    def _clean_body(self, body):
+        return [s for i, s in enumerate(body) if i == 0 or not self._is_str_expr(s)]
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        self.generic_visit(node)
+        node.body = self._clean_body(node.body)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        self.generic_visit(node)
+        node.body = self._clean_body(node.body)
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        self.generic_visit(node)
+        node.body = self._clean_body(node.body)
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        self.generic_visit(node)
+        node.body = self._clean_body(node.body)
+        return node
+
+
+class NestedListToArray(ast.NodeTransformer):
+    """Wraps module-level list-of-lists literals with np.array().
+
+    Numba cannot index Python list-of-lists with tuple subscripts
+    (e.g., x[j, k]). Converting them to numpy arrays at definition time
+    resolves this for JIT compilation.
+    """
+
+    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
+        self.generic_visit(node)
+        if (isinstance(node.value, ast.List) and node.value.elts
+                and all(isinstance(elt, ast.List) for elt in node.value.elts)):
+            node.value = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="np", ctx=ast.Load()),
+                    attr="array",
+                    ctx=ast.Load(),
+                ),
+                args=[node.value],
+                keywords=[],
+            )
+            ast.fix_missing_locations(node)
+        return node
 
 
 def preprocess_code(code: str) -> str:

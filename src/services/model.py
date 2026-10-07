@@ -33,6 +33,7 @@ class ModelService:
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
+                        max_output_tokens=65536,
                         thinking_config=types.ThinkingConfig(thinking_budget=500),
                     ),
                 )

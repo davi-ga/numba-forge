@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sentinel"
+name = "forge"
 version = "0.1.0"
-description = "Runtime sentinel for Numba-annotated Cloud Run containers: warm-up, telemetry and fallback."
+description = "LLM as an intelligent compiler: build-time modularisation + Numba annotation for serverless Python. Runtime middleware lives in forge-middleware/."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -24,7 +24,7 @@ build = [
 forge = "build_pipeline:main"
 
 [tool.setuptools]
-py-modules = ["sentinel", "build_pipeline"]
+py-modules = ["build_pipeline"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

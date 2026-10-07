@@ -60,20 +60,23 @@ class TesterService:
             )
             return None
 
-    def run(self, test_file_path: str, input_dir: str, output_dir: str) -> bool:
+    def run(self, test_file_path: str, input_dir: str, output_dir: str) -> tuple[bool, bool]:
         """Run *test_file_path* against both *input_dir* and *output_dir*.
 
         *input_dir* should contain the preprocessed code (without @njit).
         *output_dir* should contain the annotated code (with @njit).
 
-        Returns True only if both runs pass.
+        Returns ``(input_passed, output_passed)``.  A failure against the
+        preprocessed *input* means the generated test itself is invalid (the
+        input is the reference), so the caller should regenerate the test
+        rather than retry modularisation.
         """
         runs = [
-            ("input (preprocessed)", os.path.abspath(input_dir)),
-            ("output (numba-annotated)", os.path.abspath(output_dir)),
+            ("input (preprocessed)", "input", os.path.abspath(input_dir)),
+            ("output (numba-annotated)", "output", os.path.abspath(output_dir)),
         ]
-        all_passed = True
-        for label, module_dir in runs:
+        passed = {"input": True, "output": True}
+        for label, key, module_dir in runs:
             print(f"[forge] Running tests against {label}...")
             env = os.environ.copy()
             env["MODULE_DIR"] = module_dir
@@ -93,7 +96,7 @@ class TesterService:
                     timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
-                all_passed = False
+                passed[key] = False
                 print(
                     f"[forge] WARNING: Tests timed out against {label} "
                     f"(>{timeout}s).",
@@ -101,11 +104,11 @@ class TesterService:
                 )
                 continue
             if result.returncode != 0:
-                all_passed = False
+                passed[key] = False
                 print(
                     f"[forge] WARNING: Tests failed against {label}.",
                     file=sys.stderr,
                 )
-        if all_passed:
+        if passed["input"] and passed["output"]:
             print("[forge] All equivalence tests passed for both input and output.")
-        return all_passed
+        return passed["input"], passed["output"]

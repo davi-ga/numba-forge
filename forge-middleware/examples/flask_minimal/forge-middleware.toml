@@ -1,0 +1,13 @@
+# forge-middleware config example
+[settings]
+timeout_s = 60
+sample_ms = 25
+
+[[module]]
+name = "qa_lib"
+search_path = "."
+exclude = ["create_index"]        # side effects: never warm up
+
+[[module.warmup]]
+function = "extract_qa_bits"
+args = ["expr:np.zeros(16, dtype=np.uint16)", 1]

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge-middleware"
+version = "0.1.0"
+description = "Runtime middleware for forge-optimised Numba modules: opt-in warm-up, telemetry and fallback."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "psutil",
+]
+
+[project.optional-dependencies]
+flask = ["flask>=2.0"]
+test = ["pytest>=7", "flask>=2.0"]
+
+[tool.setuptools]
+packages = ["forge_middleware"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

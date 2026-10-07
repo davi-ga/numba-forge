@@ -131,6 +131,40 @@ class Inserter(ast.NodeTransformer):
 
     def __init__(self) -> None:
         self._internal_callees: set = set()
+        self._known_module_names: set = set()
+        self._jittable: set = set()
+
+    def _compute_jittable(self, tree: ast.AST) -> set:
+        """Return functions that can safely be JIT-compiled.
+
+        A function is jittable when it has no unsupported calls AND every
+        local function it calls is also jittable.  A JIT function cannot
+        call a plain Python wrapper, so call-graph consistency is required.
+        """
+        funcs = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        jittable = {
+            name for name, node in funcs.items()
+            if not self._has_unsupported_calls(node)
+        }
+        changed = True
+        while changed:
+            changed = False
+            for name in list(jittable):
+                for child in ast.walk(funcs[name]):
+                    if (
+                        isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Name)
+                        and child.func.id in funcs
+                        and child.func.id not in jittable
+                    ):
+                        jittable.discard(name)
+                        changed = True
+                        break
+        return jittable
 
     def _collect_internal_callees(self, tree: ast.AST) -> set:
         """Return names of module-level functions called by other module-level functions.
@@ -197,7 +231,12 @@ class Inserter(ast.NodeTransformer):
         return node
 
     _UNSUPPORTED_BUILTINS = frozenset(
-        {"print", "input", "open", "exec", "eval", "raise"}
+        {
+            "print", "input", "open", "exec", "eval", "raise",
+            "abort", "hex", "bin", "oct", "format", "str", "repr",
+            "getattr", "setattr", "hasattr", "vars", "dir",
+            "dict", "set", "frozenset",
+        }
     )
 
     def _has_numba_decorator(
@@ -213,6 +252,20 @@ class Inserter(ast.NodeTransformer):
             if isinstance(dec, ast.Name) and dec.id in ("njit", "jit"):
                 return True
         return False
+
+    def _strip_static_decorators(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        """Remove @staticmethod / @classmethod decorators from extracted methods.
+
+        ClassExtractor turns methods into module-level functions, but leaves
+        @staticmethod / @classmethod behind. Numba cannot decorate those
+        descriptor objects, so they must be removed.
+        """
+        node.decorator_list = [
+            dec for dec in node.decorator_list
+            if not (isinstance(dec, ast.Name) and dec.id in ("staticmethod", "classmethod", "property"))
+        ]
 
     def _strip_duplicate_numba_decorators(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
@@ -315,6 +368,35 @@ class Inserter(ast.NodeTransformer):
                     return True
         return False
 
+    _STANDARD_ANNOTATIONS = frozenset({
+        'int', 'float', 'str', 'bool', 'bytes', 'bytearray', 'complex',
+        'list', 'tuple', 'dict', 'set', 'frozenset', 'object',
+    })
+
+    def _strip_unknown_annotations(self, node: ast.FunctionDef) -> None:
+        """Remove annotations that reference names unresolvable in this module.
+
+        Class-extraction and import-stripping leave annotations such as
+        ``confidence: QAConfidence`` or ``x: List[...]`` (without a typing
+        import) pointing at undefined names.  Python evaluates annotations at
+        definition time, so a plain-Python function with a dangling annotation
+        crashes on module import.  Drop the whole annotation when any Name it
+        references is unknown.
+        """
+        known = self._STANDARD_ANNOTATIONS | self._known_module_names
+
+        def _unresolvable(ann: ast.expr) -> bool:
+            return any(
+                isinstance(child, ast.Name) and child.id not in known
+                for child in ast.walk(ann)
+            )
+
+        for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+            if arg.annotation is not None and _unresolvable(arg.annotation):
+                arg.annotation = None
+        if node.returns is not None and _unresolvable(node.returns):
+            node.returns = None
+
     def _strip_str_from_annotations(self, node: ast.FunctionDef) -> None:
         """Replace every ``str`` type reference in annotations with ``float``.
 
@@ -368,16 +450,111 @@ class Inserter(ast.NodeTransformer):
                         return True
         return False
 
+    _STRING_METHODS = frozenset({
+        "split", "join", "format", "strip", "lstrip", "rstrip", "replace",
+        "lower", "upper", "startswith", "endswith", "encode", "decode",
+        "splitlines", "partition", "rpartition", "zfill", "ljust", "rjust",
+        "title", "capitalize", "isdigit", "isalpha", "isalnum", "isspace",
+        "swapcase", "casefold", "center", "removeprefix", "removesuffix",
+        "rfind",
+    })
+
+    _DICT_METHODS = frozenset({
+        "keys", "values", "items", "get", "update", "setdefault",
+        "popitem", "fromkeys",
+    })
+
+    _STRING_NAME_HINTS = ("__str__", "__repr__", "__format__")
+
+    _EXTERNAL_LIBS = frozenset({
+        "sklearn", "KMeans", "AgglomerativeClustering",
+        "pairwise_distances", "PIL", "Image",
+        "plotly", "requests", "cv2", "hashlib", "datetime", "random",
+        "base64", "json", "shutil", "pathlib", "glob", "subprocess",
+    })
+
+    _UNSUPPORTED_NUMPY_ATTRS = frozenset({
+        "where", "select", "piecewise", "ravel_multi_index",
+        "unravel_index", "clip", "vectorize",
+    })
+
+    def _is_np_asarray_of_nonarray(self, call: ast.Call) -> bool:
+        """Mirror NumbaDecoratorFilter: np.asarray(tuple/list) is rejected."""
+        func = call.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == "asarray"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in ("np", "numpy")
+        ):
+            return False
+        if not call.args:
+            return False
+        arg = call.args[0]
+        is_np_call = (
+            isinstance(arg, ast.Call)
+            and isinstance(arg.func, ast.Attribute)
+            and isinstance(arg.func.value, ast.Name)
+            and arg.func.value.id in ("np", "numpy")
+        )
+        return not is_np_call
+
     def _has_unsupported_calls(self, node: ast.FunctionDef) -> bool:
+        if any(hint in node.name for hint in self._STRING_NAME_HINTS):
+            return True
+
+        # Collect docstring constant nodes (they are str constants but harmless)
+        docstrings = set()
+        if (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            docstrings.add(id(node.body[0].value))
+
         for child in ast.walk(node):
             if isinstance(child, ast.Try):  # try/except not supported by njit
                 return True
+            if isinstance(child, ast.JoinedStr):  # f-strings not supported
+                return True
+            if isinstance(child, ast.Lambda):  # lambdas not supported by njit
+                return True
+            if isinstance(child, (ast.Dict, ast.Set)):  # dict/set not supported
+                return True
             if (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id in self._UNSUPPORTED_BUILTINS
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                and id(child) not in docstrings
             ):
                 return True
+            if isinstance(child, ast.Call):
+                func = child.func
+                if isinstance(func, ast.Name):
+                    if func.id in self._UNSUPPORTED_BUILTINS:
+                        return True
+                    if func.id in self._EXTERNAL_LIBS:
+                        return True
+                if isinstance(func, ast.Attribute):
+                    if func.attr in self._STRING_METHODS:
+                        return True
+                    if func.attr in self._DICT_METHODS:
+                        return True
+                    if isinstance(func.value, ast.Name):
+                        if func.value.id in self._EXTERNAL_LIBS:
+                            return True
+                        if (
+                            func.value.id in ("np", "numpy")
+                            and func.attr in self._UNSUPPORTED_NUMPY_ATTRS
+                        ):
+                            return True
+                    if func.attr in self._UNSUPPORTED_NUMPY_ATTRS:
+                        return True
+                if self._is_np_asarray_of_nonarray(child):
+                    return True
+            elif isinstance(child, ast.Attribute):
+                if isinstance(child.value, ast.Name) and child.value.id in self._EXTERNAL_LIBS:
+                    return True
         return False
 
     def _get_empty_list_names(self, func_node: ast.FunctionDef) -> set:
@@ -508,17 +685,20 @@ class Inserter(ast.NodeTransformer):
         if getattr(node, '_skip_numba', False):
             return node
 
+        self._strip_static_decorators(node)
         self._strip_duplicate_numba_decorators(node)
 
         if self._has_numba_decorator(node):
             return node
-        if self._has_unsupported_calls(node) or self._has_nested_list_in_annotations(
+        if node.name not in self._jittable or self._has_nested_list_in_annotations(
             node
         ):
             return node
 
         if self._has_str_in_annotations(node):
             self._strip_str_from_annotations(node)
+
+        self._strip_unknown_annotations(node)
 
         _GenExprToListComp().visit(node)
         _ZipToRangeLoop().visit(node)
@@ -544,6 +724,30 @@ class Inserter(ast.NodeTransformer):
     def importer(self, tree: ast.AST) -> None:
         self._internal_callees = self._collect_internal_callees(tree)
 
+        known = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                known.add(node.name)
+            elif isinstance(node, ast.ClassDef):
+                known.add(node.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    known.add(alias.asname or alias.name.split('.')[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    known.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        known.add(t.id)
+        self._known_module_names = known
+        self._jittable = self._compute_jittable(tree)
+
+        # Dangling annotations crash module import even for non-JIT functions
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                self._strip_unknown_annotations(node)
+
         # Normalize "import numba as nb" to "import numba"
         has_numba_alias = False
         for node in tree.body:
@@ -563,16 +767,32 @@ class Inserter(ast.NodeTransformer):
             ast.fix_missing_locations(import_node)
 
         # Ensure "import numpy as np" is present
-        has_numpy = any(
+        has_numpy_with_alias = any(
             isinstance(node, ast.Import) and any(
-                n.name == "numpy" for n in node.names
+                n.name == "numpy" and n.asname == "np" for n in node.names
             )
             for node in tree.body
         )
-        if not has_numpy:
+        if not has_numpy_with_alias:
+            # Remove any existing "import numpy" without alias
+            tree.body = [
+                node for node in tree.body
+                if not (isinstance(node, ast.Import) and any(
+                    n.name == "numpy" for n in node.names
+                ))
+            ]
             numpy_import = ast.Import(names=[ast.alias(name="numpy", asname="np")])
             tree.body.insert(0, numpy_import)
             ast.fix_missing_locations(numpy_import)
+            
+            # Normalize all references from "numpy.xxx" to "np.xxx"
+            class _NormalizeNumpyRef(ast.NodeTransformer):
+                def visit_Name(self, node):
+                    if node.id == "numpy":
+                        node.id = "np"
+                    return node
+            
+            _NormalizeNumpyRef().visit(tree)
 
         if not any(
             isinstance(node, ast.ImportFrom) and node.module == "_numba_helpers"

@@ -22,26 +22,57 @@ class NumbaDecoratorFilter(ast.NodeTransformer):
         "crop", "rotate", "transpose", "convert",
     })
 
+    def _has_njit(self, node: ast.FunctionDef) -> bool:
+        return any(self._is_numba_decorator(dec) for dec in node.decorator_list)
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        """Remove @numba.njit transitively.
+
+        A JIT function cannot call a plain Python function. If we strip
+        @numba.njit from a function (e.g. because it uses an external
+        library), every transitive caller must also lose its @numba.njit.
+        """
+        funcs = {
+            n.name: n for n in node.body if isinstance(n, ast.FunctionDef)
+        }
+
+        jit_names = {name for name, f in funcs.items() if self._has_njit(f)}
+        for name in list(jit_names):
+            if self._uses_external_libs(funcs[name]):
+                jit_names.discard(name)
+
+        changed = True
+        while changed:
+            changed = False
+            for name in list(jit_names):
+                for child in ast.walk(funcs[name]):
+                    if (
+                        isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Name)
+                        and child.func.id in funcs
+                        and child.func.id not in jit_names
+                    ):
+                        jit_names.discard(name)
+                        changed = True
+                        break
+
+        for name, func in funcs.items():
+            if name not in jit_names:
+                func.decorator_list = [
+                    dec for dec in func.decorator_list
+                    if not self._is_numba_decorator(dec)
+                ]
+
+        return node
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        """Remove @numba.njit se a função usa bibliotecas externas."""
+        """Keep per-function traversal for non-module callers."""
         self.generic_visit(node)
-        
-        has_numba_decorator = False
-        for dec in node.decorator_list:
-            if self._is_numba_decorator(dec):
-                has_numba_decorator = True
-                break
-        
-        if not has_numba_decorator:
-            return node
-        
-        if self._uses_external_libs(node):
-            # Remove decorators @numba.njit
+        if self._has_njit(node) and self._uses_external_libs(node):
             node.decorator_list = [
                 dec for dec in node.decorator_list
                 if not self._is_numba_decorator(dec)
             ]
-        
         return node
 
     def _is_numba_decorator(self, dec: ast.AST) -> bool:
