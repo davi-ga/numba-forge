@@ -18,6 +18,8 @@ build = [
     "google-genai",
     "python-dotenv",
     "pyflakes",
+    "numba",
+    "pytest",
 ]
 
 [project.scripts]

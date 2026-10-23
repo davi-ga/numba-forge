@@ -1,8 +1,10 @@
+import ast
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from typing import Optional
 
 from services.model import ModelService
@@ -60,6 +62,49 @@ class TesterService:
             )
             return None
 
+    @staticmethod
+    def _is_meaningful_test(test_file_path: str) -> tuple[bool, str]:
+        """Reject vacuous tests (e.g. ``def test_x(): assert True``).
+
+        A test is meaningful when it has at least one ``test_*`` function, it
+        calls at least one function, and it contains a non-constant assertion.
+        This prevents the equivalence gate from "passing" on a dummy test.
+        """
+        try:
+            source = Path(test_file_path).read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (OSError, SyntaxError) as exc:
+            return False, f"could not parse test file: {exc}"
+
+        test_funcs = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test")
+        ]
+        if not test_funcs:
+            return False, "no test_* function found"
+
+        real_assertions = 0
+        calls = 0
+        for func in test_funcs:
+            for node in ast.walk(func):
+                if isinstance(node, ast.Call):
+                    calls += 1
+                elif isinstance(node, ast.Assert):
+                    test = node.test
+                    if not isinstance(test, ast.Constant):
+                        real_assertions += 1
+                    elif isinstance(test.value, (int, float)) and not isinstance(
+                        test.value, bool
+                    ):
+                        real_assertions += 1
+
+        if real_assertions == 0:
+            return False, "tests contain only constant assertions (e.g. assert True)"
+        if calls == 0:
+            return False, "tests do not call any function"
+        return True, ""
+
     def run(self, test_file_path: str, input_dir: str, output_dir: str) -> tuple[bool, bool]:
         """Run *test_file_path* against both *input_dir* and *output_dir*.
 
@@ -71,6 +116,15 @@ class TesterService:
         input is the reference), so the caller should regenerate the test
         rather than retry modularisation.
         """
+        meaningful, reason = self._is_meaningful_test(test_file_path)
+        if not meaningful:
+            print(
+                f"[forge] WARNING: generated equivalence test is not meaningful "
+                f"({reason}); rejecting it.",
+                file=sys.stderr,
+            )
+            return False, False
+
         runs = [
             ("input (preprocessed)", "input", os.path.abspath(input_dir)),
             ("output (numba-annotated)", "output", os.path.abspath(output_dir)),
