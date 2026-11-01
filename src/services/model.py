@@ -23,13 +23,14 @@ class ModelService:
         if not self.test_prompt:
             raise EnvironmentError("TEST_PROMPT environment variable is not set.")
         self.client = genai.Client(api_key=self.key)
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
     def _handle_model(self, prompt: str):
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
                 return self.client.models.generate_content(
-                    model="gemini-3.1-pro-preview",
+                    model=self.model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
