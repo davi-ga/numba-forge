@@ -18,8 +18,9 @@ from utils.preprocessor import (
 )
 from utils.modifier import Inserter
 from utils.numba_filter import NumbaDecoratorFilter
+from utils.numpy_power_rewriter import NumpyPowerRewriter
 from services.compatibility import has_actionable_errors
-from build_pipeline import _NpArrayStripper, _restore_external_imports
+from build_pipeline import _NpArrayStripper, _restore_external_imports, _has_integer_astype
 
 
 class TestRestoreExternalImports:
@@ -397,3 +398,46 @@ class TestNumbaDecoratorFilterTransitive:
         assert not _has_njit(funcs["uses_ext"])
         assert not _has_njit(funcs["mid"])
         assert not _has_njit(funcs["top"])
+
+
+class TestNumpyPowerRewriter:
+    def _rewrite(self, code):
+        return ast.unparse(
+            ast.fix_missing_locations(NumpyPowerRewriter().visit(ast.parse(code)))
+        )
+
+    def test_cube_root_restored(self):
+        out = self._rewrite("def f(x):\n    return x ** (1.0 / 3.0)\n")
+        assert "np.cbrt(x)" in out
+        assert "**" not in out
+
+    def test_float_exponent_restored_to_power(self):
+        out = self._rewrite("def f(x):\n    return x ** 2.4\n")
+        assert "np.power(x, 2.4)" in out
+
+    def test_div_float_exponent_restored_to_power(self):
+        out = self._rewrite("def f(x):\n    return x ** (1.0 / 2.4)\n")
+        assert "np.power(x, 1.0 / 2.4)" in out
+
+    def test_integer_exponent_untouched(self):
+        out = self._rewrite("def f(x):\n    return x ** 2\n")
+        assert "x ** 2" in out
+        assert "np.power" not in out
+
+    def test_non_pow_untouched(self):
+        out = self._rewrite("def f(x):\n    return x * 2.0\n")
+        assert "x * 2.0" in out
+
+
+class TestQuantizationGuard:
+    def test_uint8_astype_detected(self):
+        assert _has_integer_astype("import numpy\nx = (a * 255).astype(numpy.uint8)\n")
+
+    def test_int16_string_astype_detected(self):
+        assert _has_integer_astype("x = a.astype('int16')\n")
+
+    def test_float_astype_not_detected(self):
+        assert not _has_integer_astype("x = a.astype(numpy.float64)\n")
+
+    def test_no_astype_not_detected(self):
+        assert not _has_integer_astype("x = a * 2.0\n")

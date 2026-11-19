@@ -35,6 +35,7 @@ from services.tester import TesterService
 from utils.vectorize_rewriter import VectorizeRewriter
 from utils.builtin_rewriter import BuiltinRewriter
 from utils.unique_rewriter import UniqueRewriter
+from utils.numpy_power_rewriter import NumpyPowerRewriter
 from utils.preprocessor import NestedListToArray, StrCommentStripper
 
 
@@ -244,6 +245,7 @@ def _postprocess_documents(documents: list[dict]) -> list[dict]:
             
             # Apply transformers
             tree = StrCommentStripper().visit(tree)
+            tree = NumpyPowerRewriter().visit(tree)
             tree = VectorizeRewriter().visit(tree)
             tree = BuiltinRewriter().visit(tree)
             tree = UniqueRewriter().visit(tree)
@@ -437,6 +439,52 @@ def _validate_documents(documents: list) -> None:
             raise ValueError(
                 f"Item {i} is missing required key(s): {', '.join(missing)}."
             )
+
+
+_INTEGER_DTYPES = frozenset({
+    "int", "int8", "int16", "int32", "int64",
+    "uint", "uint8", "uint16", "uint32", "uint64",
+    "intp", "uintp", "intc", "uintc", "int_",
+    "byte", "ubyte", "short", "ushort",
+})
+
+
+def _is_integer_dtype(node: ast.expr) -> bool:
+    """Return True when *node* names a numpy integer dtype."""
+    if isinstance(node, ast.Attribute):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id in ("np", "numpy")
+            and node.attr in _INTEGER_DTYPES
+        )
+    if isinstance(node, ast.Name):
+        return node.id in _INTEGER_DTYPES
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value in _INTEGER_DTYPES
+    return False
+
+
+def _has_integer_astype(body: str) -> bool:
+    """Return True when *body* casts a value to an integer dtype via astype."""
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "astype"
+        ):
+            continue
+        if any(_is_integer_dtype(arg) for arg in node.args):
+            return True
+        if any(
+            kw.arg == "dtype" and _is_integer_dtype(kw.value)
+            for kw in node.keywords
+        ):
+            return True
+    return False
 
 
 def run(
@@ -683,6 +731,18 @@ def run(
                 "Proceeding with annotation (some functions may fail at runtime).",
                 file=sys.stderr,
             )
+
+        # Quantization guard: keep the AST-preprocessed body for files whose
+        # float pipeline feeds an integer cast. The LLM's scalarization drifts
+        # at the last ulp and integer truncation amplifies it into a ±1 error.
+        preprocessed_by_path = {d["path"]: d["body"] for d in preprocessed_docs}
+        for doc in documents:
+            if _has_integer_astype(preprocessed_by_path.get(doc["path"], "")):
+                doc["body"] = preprocessed_by_path[doc["path"]]
+                print(
+                    f"[forge] Quantization guard: kept AST body for '{doc['path']}'",
+                    file=sys.stderr,
+                )
 
         # Step 3.6 — Post-process (convert LLM-generated patterns to Numba-compatible code)
         print(f"[forge] Post-processing {len(documents)} file(s)...")
