@@ -1,97 +1,64 @@
 # forge
 
-**LLM as an Intelligent Compiler** — uses the Gemini API at **build time** to modularize Python source code and inject `@numba.njit` decorators, then provides a lightweight **runtime middleware** (`sentinel.Middleware`) for Cloud Run containers with warm-up, telemetry and fallback.
+**LLM como compilador em tempo de build** — usa a API do Gemini em **tempo de construção** para modularizar código Python e injetar decoradores `@numba.njit`. A ferramenta transforma um conjunto de funções puras em código compatível com compilação JIT, preservando nomes e assinaturas originais, de modo que a aplicação as utilize sem alterar o código que as consome. A imagem publicada já contém o código otimizado, sem exigir refatoração manual nem uma camada interposta em tempo de execução.
 
-> Full system reference (components, contracts, failure modes):
-> **[`docs/ARQUITETURA.md`](docs/ARQUITETURA.md)**
+<!-- =================================================================== -->
+<!-- ESPAÇO RESERVADO — DIAGRAMA COMPLETO DA FERRAMENTA (VISÃO MACRO)      -->
+<!--                                                                       -->
+<!-- Inserir aqui o diagrama com o fluxo completo da ferramenta.           -->
+<!-- =================================================================== -->
 
----
-
-## How it works
-
-Two planes: a build-time compiler pipeline and a runtime middleware.
-
-```
-BUILD TIME (CI/CD)                               RUNTIME (Cloud Run)
-──────────────────────────────────────────       ──────────────────────────────────────
-forge --source-dir src/ --output-dir dist/        gunicorn boots app.py
-  │                                                 │
-  ├── 1. PatcherService                             ├── Middleware(modules=[...])
-  │     Discovers .py files, serialises to              registers functions AND
-  │     [{path, body}] payload                          Numba CPUDispatchers
-  │                                                 │
-  ├── 2. PreprocessorService (AST, before the LLM)  ├── warmup(inputs={...})  ← SYNC
-  │     import strip → orphan-call strip → class        compiles every declared
-  │     extraction → self strip → IO strip →            signature AT BOOT (Cloud Run
-  │     empty-block strip → boolean-mask rewrite →      only allocates CPU during
-  │     nested-list→np.array                            requests, so async warmup
-  │                                                     stalls — see docs)
-  ├── 3. TesterService (LLM)                        │
-  │     generates equivalence test suite            ├── cache JIT na imagem:
-  │     (validated against the reference code)      │   @numba.njit(cache=True) +
-  │                                                 │   RUN warmup_build.py → boot
-  ├── 4. ModelService (LLM modularization)          │   carrega cache (~s, no min)
-  │     gemini-3.1-pro-preview; structure, stub,    │
-  │     hallucinated-call and compatibility         ├── call("func", *args)
-  │     validators gate a retry loop (only            │   telemetry: time_ms,
-  │     actionable failures re-invoke the LLM)        │   cpu_avg, mem_mb_avg +
-  │                                                 │   automatic fallback
-  ├── 5. AnnotatorService (AST)                     └── fallback: if the JIT
-  │     jittability fixpoint over the call graph        dispatcher raises, the
-  │     (a function is annotated only if its local      registered original
-  │     callees are too), @numba.njit injection,          callable re-runs
-  │     wrapper generation (_sanitize/_deep_to_list)
-  │                                                 First real request never pays
-  ├── 6. Postprocess + import guards                LLVM compilation:
-  │     vectorize/builtin/unique rewriters,         measured cold 1st request:
-  │     unused-import strip, external-import        10.4 ms (yuki-mt) / 0.03 ms
-  │     restoration (try/except ImportError)        (cube-builder) vs 1575/586 ms
-  │                                                 without the middleware
-  └── 7. Equivalence gate (pytest)
-        same suite vs reference and annotated
-        output; failing reference = bad test →
-        regenerate; 3 attempts → abort
-```
-
-Measured outcomes of the full system (Cloud Run, 1 vCPU): **yuki-mt ≈ 115×**
-compute speedup after LLM modularization; reproducible success rate ≥ 90% per
-benchmark — details in `docs/ANALISE_RESULTADOS_EXECUTADOS.md`.
+> **Diagrama da ferramenta:** _(espaço reservado — inserir aqui o diagrama completo do fluxo)_
 
 ---
 
-## Installation
+## Como funciona
 
-**Build pipeline (CI/CD — includes Gemini SDK):**
+O forge opera exclusivamente em tempo de build. O modelo de linguagem, orientado por um prompt de modularização, infere as transformações estruturais que separam o núcleo computacional puro das operações de entrada e saída. O transformador sintático baseado em AST aplica e saneia essas transformações, insere as diretivas de compilação e garante que apenas as funções seguramente compiláveis recebam o decorador.
+
+Fluxo de execução, etapa por etapa:
+
+1. **Descoberta** — o serviço de arquivos percorre o diretório de origem, seleciona os módulos Python e os serializa no arranjo JSON `[{path, body}]`. Esse arranjo, e não o código original, percorre as etapas seguintes.
+2. **Pré-processamento (AST)** — antes do envio ao modelo, o código passa por transformações determinísticas que o deixam limpo: remoção de operações de entrada e saída, extração de métodos de classe para funções de nível de módulo, ajuste de assinaturas e remoção de importações externas incompatíveis.
+3. **Geração do teste de equivalência (LLM)** — a partir do conjunto pré-processado, o modelo gera um único arquivo de teste (`test_equivalence.py`) com asserções baseadas em invariantes (comprimento, faixa numérica, ordenação e idempotência), em vez de valores esperados fixos.
+4. **Modularização (LLM)** — o modelo `gemini-3.1-pro-preview` devolve os corpos reescritos, já separados entre núcleo computacional e operações de entrada e saída, sem qualquer diretiva de compilação.
+5. **Validação estrutural** — cada arquivo é compilado sintaticamente; o fluxo verifica que nenhum arquivo foi descartado, que nenhuma função teve o corpo reduzido a um esboço vazio e que nenhuma chamada a um nome inexistente foi introduzida. Em paralelo, o verificador de compatibilidade percorre as funções em busca de construções incompatíveis com o modo `nopython`.
+6. **Decisão de retentativa** — os problemas encontrados são classificados em acionáveis (uma nova geração pode corrigi-los) e não acionáveis (decorrem de dependências externas ou de estruturas inerentemente interpretadas). Apenas os acionáveis disparam nova chamada ao modelo, dentro de um limite de tentativas. Esgotadas as tentativas, o fluxo prossegue com as funções mantidas em sua forma interpretada.
+7. **Guarda de quantização** — quando o corpo pré-processado alimenta uma conversão para tipo inteiro, o fluxo preserva esse corpo em lugar da versão do modelo, pois a reescrita escalar pode deslocar o último bit do resultado e amplificar o erro na truncagem inteira.
+8. **Pós-processamento (AST)** — normaliza a saída do modelo antes da anotação: converte `np.vectorize` em laços explícitos, substitui `hex`/`bin`/`oct` e `np.unique` com contagem por rotinas auxiliares, restaura a semântica numérica quando a exponenciação escalar altera o último bit (devolvendo `np.power` e `np.cbrt`) e ajusta chamadas redundantes a `np.array`.
+9. **Anotação (AST)** — o transformador principal calcula um ponto fixo de compilabilidade sobre o grafo local de chamadas, insere `@numba.njit` nas funções compiláveis, desdobra as funções públicas em núcleo compilado e invólucro interpretado (preservando nome e assinatura) e remove a diretiva das funções que permanecem arriscadas.
+10. **Sanitização de importações** — remove as importações não utilizadas e restaura, a partir do código original, as dependências externas que o modelo deixou de declarar, envolvidas em blocos `try/except ImportError`.
+11. **Gravação dos artefatos** — escreve os arquivos no diretório de saída, acrescentando o módulo de rotinas auxiliares (`_numba_helpers`) e os arquivos de inicialização de pacote.
+12. **Verificação de equivalência** — o teste é executado contra as duas versões. Falha na versão pré-processada indica que o próprio teste é inválido, o que leva à sua reestruturação; falha apenas na versão anotada indica divergência introduzida pela transformação, o que leva ao reprocessamento do código. Persistindo o erro, o build é abortado em vez de publicar uma imagem incorreta.
+
+### Fallback
+
+O fallback é granular e opera por função. As funções que não satisfazem as condições de compilação permanecem interpretadas e sem o decorador, mas seguem acessíveis pelo invólucro que preserva o nome e a assinatura originais. A classificação entre problemas acionáveis e não acionáveis, aliada à restauração de importações em `try/except ImportError`, evita retentativas inúteis e garante que o módulo carregue mesmo diante de uma dependência ausente. A ferramenta nunca publica uma função anotada que não seja seguramente compilável.
+
+---
+
+## Instalação
+
+**Pipeline de build (CI/CD — inclui o SDK do Gemini):**
+
 ```bash
 pip install "forge[build] @ git+https://github.com/davi-ga/forge"
 ```
 
-**Runtime middleware (Cloud Run container — separate package):**
-```bash
-pip install "forge-middleware[flask] @ git+https://github.com/davi-ga/forge.git#subdirectory=forge-middleware"
-```
-
-> The repository ships **two distributions**: `forge` (build-time pipeline,
-> repo root) and `forge-middleware` (runtime, `forge-middleware/`
-> subdirectory). The legacy `src/sentinel.py` is kept only for benchmark
-> containers migrated so far.
-
-The optimized runtime also needs `numba` + `numpy` in the *application's*
-`requirements.txt` (the generated code imports them directly).
+O runtime otimizado também precisa de `numba` e `numpy` no `requirements.txt` da *aplicação*, já que o código gerado os importa diretamente.
 
 ---
 
-## Build pipeline
+## Pipeline de build
 
-### Environment variables
+### Variáveis de ambiente
 
-| Variable | Required | Description |
-|---|---|---|
-| `GEMINI_API_KEY` | Yes | Gemini API key |
-| `MODULARIZE_PROMPT` | Yes | System prompt for code modularization (must return `[{path, body}]` JSON) |
-| `TEST_PROMPT` | Yes | System prompt for equivalence-test generation |
-| `SOURCE_DIR` / `OUTPUT_DIR` | No | CLI flag defaults |
-| `FORGE_TEST_TIMEOUT` | No | Per-side pytest timeout, seconds (default 120) |
+- `GEMINI_API_KEY` _(obrigatória)_ — chave da API do Gemini.
+- `MODULARIZE_PROMPT` _(obrigatória)_ — prompt de sistema para a modularização (deve retornar `[{path, body}]` em JSON).
+- `TEST_PROMPT` _(obrigatória)_ — prompt de sistema para a geração do teste de equivalência.
+- `SOURCE_DIR` / `OUTPUT_DIR` _(opcionais)_ — padrões das flags de CLI.
+- `FORGE_MAX_ATTEMPTS` _(opcional)_ — máximo de tentativas do pipeline (padrão 3).
+- `FORGE_TEST_TIMEOUT` _(opcional)_ — timeout por lado do pytest, em segundos (padrão 120).
 
 ### CLI
 
@@ -99,7 +66,7 @@ The optimized runtime also needs `numba` + `numpy` in the *application's*
 forge --source-dir my_project/ --output-dir dist/
 ```
 
-### Python API
+### API Python
 
 ```python
 from build_pipeline import run
@@ -112,90 +79,41 @@ created_files = run(source_dir="my_project/", output_dir="dist/", max_attempts=3
 ```yaml
 steps:
   - name: "python:3.12-slim"
-    entrypoint: pip
-    args: ["install", "--no-cache-dir", "forge[build]@git+https://github.com/davi-ga/forge.git"]
-
-  - name: "python:3.12-slim"
-    entrypoint: forge
-    args: ["--source-dir", "my_project/", "--output-dir", "dist/"]
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir .[build] && \
+        forge --source-dir my_project/ --output-dir dist/
     secretEnv: ["GEMINI_API_KEY", "MODULARIZE_PROMPT", "TEST_PROMPT"]
 
   - name: "gcr.io/cloud-builders/docker"
     args: ["build", "-t", "gcr.io/$PROJECT_ID/my-service", "."]
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/GEMINI_API_KEY/versions/latest
+      env: "GEMINI_API_KEY"
+    - versionName: projects/$PROJECT_ID/secrets/MODULARIZE_PROMPT/versions/latest
+      env: "MODULARIZE_PROMPT"
+    - versionName: projects/$PROJECT_ID/secrets/TEST_PROMPT/versions/latest
+      env: "TEST_PROMPT"
 ```
 
 ---
 
-## Runtime middleware (`forge-middleware`)
+## Implantação (Cloud Run)
 
-Config-driven, framework-optional. `forge-middleware.toml`:
+No fluxo de implantação, o `forge` é executado como uma etapa do **Cloud Build**, o serviço de integração contínua do Google Cloud. Essa etapa instala a ferramenta com suas dependências de construção, invoca o comando sobre o diretório de funções puras e recebe do gerenciador de segredos a chave de acesso e os prompts. O diretório otimizado é gerado no espaço de trabalho do próprio build e **não existe no repositório**, o que garante que o artefato implantado seja exatamente a saída produzida naquele momento.
 
-```toml
-[settings]
-timeout_s = 30          # per-function warmup budget
-sample_ms = 25          # telemetry sampling
+Em seguida, o `Dockerfile` da aplicação copia o diretório otimizado e o módulo de rotinas auxiliares para dentro da imagem, juntamente com as dependências de Numba e NumPy. O diretório de cache do Numba é fixado em um caminho interno da imagem, e um passo de construção executa uma rotina de aquecimento (`warmup_build.py`) que invoca cada núcleo com uma entrada representativa, antecipando a compilação LLVM para a fase de construção e gravando o resultado nesse cache. O contêiner é, então, publicado no Cloud Run, que o instancia sob demanda.
 
-[[module]]
-name = "processing"
-search_path = "optimized"
-exclude = ["create_index"]            # side effects: never warm up
-
-[[module.warmup]]
-function = "extract_qa_bits"
-args = ["expr:np.zeros(16, dtype=np.uint16)", 1]
-```
-
-Flask integration (5 lines):
-
-```python
-from flask import Flask
-from forge_middleware import FlaskMiddleware
-
-app = Flask(__name__)
-fm = FlaskMiddleware("forge-middleware.toml").init_app(app)  # sync warmup + /health
-
-# handlers: fm.call("extract_qa_bits", band_data, bit_location)
-```
-
-Bare usage (no framework):
-
-```python
-from forge_middleware import Middleware
-
-mw = Middleware(modules=[processing])
-mw.warmup(inputs={"extract_qa_bits": (np.zeros(16, dtype=np.uint16), 1)})
-out = mw.call("extract_qa_bits", band_data, bit_location)
-```
-
-Key semantics:
-
-- **Opt-in warmup**: `warmup()` executes **only** the declared functions;
-  everything else is reported `"skipped"`. A generic app can have side
-  effects (disk, network, DB) — boot must never trigger them. The legacy
-  "call everything with dummy args" mode is available via
-  `include_undeclared=True` for code proven pure.
-- **Registration** covers plain functions, builtins *and* Numba
-  `CPUDispatcher` objects (kernels called internally keep their name as the
-  dispatcher itself — `inspect.isfunction` would miss them).
-- **Timeout per function**: a hanging kernel cannot wedge the boot.
-- **`call()`** adds CPU/RAM telemetry and re-executes the registered
-  fallback when the optimized path raises (`fallback_used` + counters in
-  `mw.stats()`).
-- **`expr:`-args** evaluate in a restricted namespace (`np`/`numpy` only —
-  no builtins, no imports).
-- `warmup_async()` exists for platforms with persistent CPU (e.g.
-  Kubernetes); on Cloud Run it starves — use the sync form at import.
-
-Full rationale, trade-offs and measured numbers:
-**[`docs/MIDDLEWARE_WARMUP.md`](docs/MIDDLEWARE_WARMUP.md)** (§7 covers the
-disadvantages of boot-time warmup).
-
----
-
-## Dockerfile (Cloud Run, pattern validated in benchmarks)
+No carregamento da aplicação, uma segunda rotina de aquecimento atua de forma síncrona sobre o mesmo cache, deixando as assinaturas declaradas prontas antes que a primeira requisição seja atendida. A sincronia é necessária porque o Cloud Run só aloca CPU durante o atendimento de requisições, e uma inicialização assíncrona seria interrompida. Desse modo, o custo de aquecimento do compilador JIT é antecipado para a fase de build e para a inicialização da instância, e não para o caminho crítico da requisição.
 
 ```dockerfile
 FROM python:3.12-slim
+
+# libgomp1 é exigido pelo Numba em tempo de execução (threads OpenMP)
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -204,81 +122,79 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY optimized/ optimized/        # forge artefacts + _numba_helpers.py
-COPY forge_middleware/ forge_middleware/   # or `pip install forge-middleware[flask]`
-COPY forge-middleware.toml .
+COPY optimized/ optimized/   # artefatos do forge + _numba_helpers.py
 COPY warmup_build.py .
 COPY app.py .
 
 ENV NUMBA_CACHE_DIR=/app/.nv_jit_cache
-RUN python warmup_build.py        # JIT cache baked into the image
+RUN python warmup_build.py   # cache do JIT embutido na imagem
 
 EXPOSE 8080
-# timeout > warmup duration: worker only becomes ready after warming
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "300", "app:app"]
 ```
 
-`app.py` calls `mw.warmup(inputs=...)` synchronously at import, so the first
-real request never pays LLVM compilation.
+Um template completo de `cloudbuild.yaml` e `Dockerfile` está em `examples/`.
 
 ---
 
-## Project structure
+## Estrutura do projeto
 
 ```
 src/
-  build_pipeline.py     # Build-time pipeline — CLI + Python API (run())
-  sentinel.py           # LEGACY runtime middleware (kept for un-migrated deploys;
-                        # new code uses forge-middleware/ instead)
+  build_pipeline.py     # Pipeline de build — CLI + API Python (run())
   services/
-    patcher.py          # File discovery, payload serialisation, artefact I/O
-    preprocessor.py     # AST pre-processing orchestration (before the LLM)
-    model.py            # Gemini API client (modularize + test generation)
-    tester.py           # Equivalence-test generation + input/output runner
-    annotator.py        # Numba annotation orchestration
-    compatibility.py    # Compatibility checker + actionable-error classifier
+    patcher.py          # Descoberta de arquivos, serialização do payload e E/S de artefatos
+    preprocessor.py     # Orquestração do pré-processamento (AST, antes do LLM)
+    model.py            # Cliente da API Gemini (modularização + geração de teste)
+    tester.py           # Geração e execução do teste de equivalência
+    annotator.py        # Orquestração da anotação Numba
+    compatibility.py    # Verificador de compatibilidade + classificador de erros acionáveis
   utils/
-    preprocessor.py     # AST transformers (class extraction, IO/orphan strip,
-                        # boolean-mask rewrite, nested lists, comments…)
-    modifier.py         # Inserter: jittability fixpoint + @njit + wrappers
-    numba_filter.py     # transitive @njit stripper (external libs)
-    vectorize_rewriter.py / builtin_rewriter.py / unique_rewriter.py
-benchmarks/
-  benchmark_reproducibility.py   # 10 runs × benchmark, success/cost/variance
-  gcr/                           # Cloud Run apps, load tests, A/B results
-  gcr/run_gcr_requests.py        # N requests per service, warm-up + stats
+    preprocessor.py     # Transformadores AST (extração de classe, remoção de E/S,
+                        # máscara booleana, listas aninhadas, comentários…)
+    modifier.py         # Inserter: ponto fixo de compilabilidade + @njit + invólucros
+    numba_filter.py     # Remoção transitiva de @njit (bibliotecas externas)
+    deep.py             # Rotinas de conversão de tipos (_sanitize_for_numba, _deep_to_list)
+    vectorize_rewriter.py / builtin_rewriter.py / unique_rewriter.py / numpy_power_rewriter.py
 tests/
-  test_pipeline_fixes.py         # regression tests for every pipeline fix
-  test_sentinel_middleware.py    # legacy middleware tests (src/sentinel.py)
-forge-middleware/                # standalone runtime package
-  forge_middleware/
-    middleware.py                # Middleware + ResourceMonitor (opt-in warmup)
-    config.py                    # TOML schema + restricted arg evaluation
-    flask_adapter.py             # FlaskMiddleware (init_app + /health)
-  tests/                         # 32 tests: core, config, security, flask
-  examples/flask_minimal/        # runnable 5-line integration example
+  test_pipeline_fixes.py    # Testes de regressão para cada correção do pipeline
+  test_safety_guards.py     # Testes das guardas de segurança (quantização, tipos)
+benchmarks/
+  benchmark_reproducibility.py   # 10 execuções × benchmark: sucesso, custo e variância
+  gcr/                           # Aplicações no Cloud Run, testes de carga e resultados A/B
+  gcr/run_gcr_requests.py        # N requisições por serviço, com aquecimento e estatísticas
 docs/
-  ARQUITETURA.md                 # ← system reference (start here)
-  MIDDLEWARE_WARMUP.md           # middleware deep-dive + trade-offs
-  ANALISE_RESULTADOS_EXECUTADOS.md  # what the experiments establish
-  FASE2_GCR_RESULTADOS.md / GCR_REQUESTS_RESULTADOS.md / CUBE_BUILDER_ERROS.md
-  COST_ANALYSIS_GEMINI_3.1.md / PIPELINE_CHANGES_GEMINI_3.1.md / ALTERACOES_IMG2PALETTE.md
-pyproject.toml          # package metadata, CLI entry point, extras
+  catalogo.md                    # Catálogo das aplicações serverless (CPU-bound × I/O-bound)
+examples/
+  Dockerfile / cloudbuild.yaml   # Template de implantação para usuários finais
+pyproject.toml          # Metadados do pacote, ponto de entrada da CLI, extras
 ```
 
 ---
 
-## Requirements
+## Planos futuros
+
+Uma **camada de execução em tempo de requisição** chegou a ser prototipada (o pacote `forge-middleware`), mas **não integra o desenho final da ferramenta**, que é estritamente de tempo de build. O protótipo previa três funções, todas registradas como trabalho futuro:
+
+- **Aquecimento declarativo** na inicialização, compilando as assinaturas de Numba fora do caminho da requisição, sem invocar funções não declaradas.
+- **Telemetria** por chamada (tempo, CPU e memória).
+- **Fallback automático** para a versão interpretada quando a versão otimizada falha, com contagem do evento.
+
+A decisão vigente é manter o escopo da ferramenta restrito à transformação em tempo de build (pasta de entrada → pasta otimizada), com o fallback descrito apenas no nível de construção.
+
+---
+
+## Requisitos
 
 - Python ≥ 3.11
-- Runtime image: `numba`, `numpy` (+ `psutil` for telemetry; `flask`/`gunicorn` in the app)
-- Build extras: `google-genai`, `python-dotenv`, `pyflakes`
+- Imagem de runtime: `numba`, `numpy` (e `libgomp1` no sistema)
+- Extras de build: `google-genai`, `python-dotenv`, `pyflakes`, `numba`, `pytest`
 
-## Validation status (Sept/2026)
+---
 
-| Plane | Evidence |
-|---|---|
-| Pipeline reproducibility | yuki-mt 10/10, img2palette 9/10 on 30-run benchmark (`benchmarks/reproducibility_results.json`) |
-| GCR runtime | yuki-mt ≈115× compute; middleware cold-start A/B; 30/30 requests OK |
-| Regressions | 40/40 unit tests (`tests/`) |
-| Pending | full pipeline with LLM on GCR (blocked by GCP billing); cube-builder rate (API quota) |
+## Status de validação (set./2026)
+
+- **Reprodutibilidade do pipeline** — yuki-mt 10/10 e img2palette 9/10 em benchmark de 30 execuções (`benchmarks/reproducibility_results.json`).
+- **Execução no Cloud Run** — yuki-mt com ganho de computação em torno de 115×; 30/30 requisições bem-sucedidas.
+- **Regressões** — suíte de testes de regressão do pipeline em `tests/` passando.
+- **Pendente** — pipeline completo com LLM no GCR (bloqueado por faturamento do GCP); taxa do cube-builder (cota da API).
