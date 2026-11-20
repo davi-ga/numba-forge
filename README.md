@@ -106,9 +106,7 @@ availableSecrets:
 
 No fluxo de implantação, o `forge` é executado como uma etapa do **Cloud Build**, o serviço de integração contínua do Google Cloud. Essa etapa instala a ferramenta com suas dependências de construção, invoca o comando sobre o diretório de funções puras e recebe do gerenciador de segredos a chave de acesso e os prompts. O diretório otimizado é gerado no espaço de trabalho do próprio build e **não existe no repositório**, o que garante que o artefato implantado seja exatamente a saída produzida naquele momento.
 
-Em seguida, o `Dockerfile` da aplicação copia o diretório otimizado e o módulo de rotinas auxiliares para dentro da imagem, juntamente com as dependências de Numba e NumPy. O diretório de cache do Numba é fixado em um caminho interno da imagem, e um passo de construção executa uma rotina de aquecimento (`warmup_build.py`) que invoca cada núcleo com uma entrada representativa, antecipando a compilação LLVM para a fase de construção e gravando o resultado nesse cache. O contêiner é, então, publicado no Cloud Run, que o instancia sob demanda.
-
-No carregamento da aplicação, uma segunda rotina de aquecimento atua de forma síncrona sobre o mesmo cache, deixando as assinaturas declaradas prontas antes que a primeira requisição seja atendida. A sincronia é necessária porque o Cloud Run só aloca CPU durante o atendimento de requisições, e uma inicialização assíncrona seria interrompida. Desse modo, o custo de aquecimento do compilador JIT é antecipado para a fase de build e para a inicialização da instância, e não para o caminho crítico da requisição.
+Em seguida, o `Dockerfile` da aplicação copia o diretório otimizado e o módulo de rotinas auxiliares para dentro da imagem, juntamente com as dependências de Numba e NumPy, e o contêiner é publicado no Cloud Run, que o instancia sob demanda. O aquecimento antecipado do compilador JIT, com cache em disco do Numba, ficou fora do desenho final (ver **Planos futuros**).
 
 ```dockerfile
 FROM python:3.12-slim
@@ -123,11 +121,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY optimized/ optimized/   # artefatos do forge + _numba_helpers.py
-COPY warmup_build.py .
 COPY app.py .
-
-ENV NUMBA_CACHE_DIR=/app/.nv_jit_cache
-RUN python warmup_build.py   # cache do JIT embutido na imagem
 
 EXPOSE 8080
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "300", "app:app"]
@@ -176,7 +170,7 @@ pyproject.toml          # Metadados do pacote, ponto de entrada da CLI, extras
 
 Uma **camada de execução em tempo de requisição** chegou a ser prototipada (o pacote `forge-middleware`), mas **não integra o desenho final da ferramenta**, que é estritamente de tempo de build. O protótipo previa três funções, todas registradas como trabalho futuro:
 
-- **Aquecimento declarativo** na inicialização, compilando as assinaturas de Numba fora do caminho da requisição, sem invocar funções não declaradas.
+- **Aquecimento antecipado com cache em disco**. Antes da implantação, uma rotina de aquecimento compilaria cada núcleo e gravaria o resultado no cache do Numba (`cache=True` + `NUMBA_CACHE_DIR`) dentro da imagem; na inicialização, uma segunda rotina síncrona carregaria esse mesmo cache, deixando as assinaturas prontas antes da primeira requisição. Esse mecanismo **envolve o middleware** e, por não ter sido finalizado a tempo, não foi adotado.
 - **Telemetria** por chamada (tempo, CPU e memória).
 - **Fallback automático** para a versão interpretada quando a versão otimizada falha, com contagem do evento.
 
@@ -191,10 +185,3 @@ A decisão vigente é manter o escopo da ferramenta restrito à transformação 
 - Extras de build: `google-genai`, `python-dotenv`, `pyflakes`, `numba`, `pytest`
 
 ---
-
-## Status de validação (set./2026)
-
-- **Reprodutibilidade do pipeline** — yuki-mt 10/10 e img2palette 9/10 em benchmark de 30 execuções (`benchmarks/reproducibility_results.json`).
-- **Execução no Cloud Run** — yuki-mt com ganho de computação em torno de 115×; 30/30 requisições bem-sucedidas.
-- **Regressões** — suíte de testes de regressão do pipeline em `tests/` passando.
-- **Pendente** — pipeline completo com LLM no GCR (bloqueado por faturamento do GCP); taxa do cube-builder (cota da API).
