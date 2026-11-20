@@ -2,13 +2,13 @@
 
 **LLM como compilador em tempo de build** — usa a API do Gemini em **tempo de construção** para modularizar código Python e injetar decoradores `@numba.njit`. A ferramenta transforma um conjunto de funções puras em código compatível com compilação JIT, preservando nomes e assinaturas originais, de modo que a aplicação as utilize sem alterar o código que as consome. A imagem publicada já contém o código otimizado, sem exigir refatoração manual nem uma camada interposta em tempo de execução.
 
-<!-- =================================================================== -->
-<!-- ESPAÇO RESERVADO — DIAGRAMA COMPLETO DA FERRAMENTA (VISÃO MACRO)      -->
-<!--                                                                       -->
-<!-- Inserir aqui o diagrama com o fluxo completo da ferramenta.           -->
-<!-- =================================================================== -->
 
-> **Diagrama da ferramenta:** _(espaço reservado — inserir aqui o diagrama completo do fluxo)_
+
+> **Diagrama da ferramenta:**
+
+
+<img width="1997" height="8642" alt="mermaid-diagram-2026-11-20-154427 (1)" src="https://github.com/user-attachments/assets/8a037b60-70a8-4d78-9101-e054569d4264" />
+
 
 ---
 
